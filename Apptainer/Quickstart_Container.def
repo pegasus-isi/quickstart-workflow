@@ -1,0 +1,24 @@
+Bootstrap: docker
+From: python:3.11-slim
+
+# Container for the Pegasus quickstart (Hello World) workflow.
+#
+# The workflow's only tool is bin/pegasus-keg.py, which needs a Python 3
+# interpreter plus psutil (used to spin the CPU for --spin-time seconds; the
+# script falls back to sleeping when psutil is missing).
+#
+# Build:
+#   apptainer build Quickstart_Container.sif Apptainer/Quickstart_Container.def
+#
+# Use:
+#   ./workflow_generator.py --container Quickstart_Container.sif
+
+%post
+    pip install --no-cache-dir psutil==5.9.8
+
+%environment
+    # Do not buffer output, so Pegasus captures job logs as they are produced
+    export PYTHONUNBUFFERED=1
+
+%runscript
+    exec /bin/bash "$@"
