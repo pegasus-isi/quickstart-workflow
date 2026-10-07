@@ -82,6 +82,14 @@ apptainer build Quickstart_Container.sif Apptainer/Quickstart_Container.def
 ./workflow_generator.py --container Quickstart_Container.sif
 ```
 
+The image is Debian 13 (`python:3.11-slim-trixie`) and has no curl/wget, so it
+cannot download a Pegasus worker package for itself. With `--container`, the
+generator asks `pegasus-version` for the planner's version and stages the
+matching `x86_64_deb_13` worker package into each job (`pegasus::worker` in the
+transformation catalog, `pegasus.transfer.worker.package.autodownload = false`).
+If you change the base image, change `WORKER_PACKAGE_PLATFORM` in
+`workflow_generator.py` to match.
+
 ## Usage
 
 ### Test Locally First

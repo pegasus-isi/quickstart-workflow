@@ -24,6 +24,7 @@ hosted catalog you provide is kept, and only missing entries are added.
 import argparse
 import logging
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -57,9 +58,29 @@ TOOL_CONFIGS = {
     "world": {"memory": "1 GB", "cores": 1, "runtime": 600},
 }
 
+# Pegasus worker package (kickstart etc.) used *inside* the container, which is
+# Debian 13 (python:3.11-slim-trixie) whatever the submit host runs. Left
+# alone, PegasusLite sees the submit host's package as a mismatch and tries to
+# download a deb_13 one from inside the container, which has no curl/wget
+# (exit code 71). Change this with the container's base image.
+WORKER_PACKAGE_PLATFORM = "x86_64_deb_13"
+WORKER_PACKAGE_URL = ("https://download.pegasus.isi.edu/pegasus/{v}/"
+                      "pegasus-worker-{v}-" + WORKER_PACKAGE_PLATFORM + ".tar.gz")
+
 DEFAULT_INPUT_CONTENTS = (
     "This is the contents of the input file for the hello world workflow!"
 )
+
+
+def planner_version():
+    """Version of the pegasus-plan that will plan this workflow, or None."""
+    try:
+        out = subprocess.run(["pegasus-version"], capture_output=True,
+                             text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    version = out.stdout.strip()
+    return version if out.returncode == 0 and version else None
 
 
 class QuickstartWorkflow:
@@ -73,6 +94,7 @@ class QuickstartWorkflow:
     dagfile = None
     wf_dir = None
     local_storage_dir = None
+    worker_package_url = None
     wf_name = "hello-world"
 
     def __init__(self, dagfile="workflow.yml", input_file=None, container_image=None):
@@ -101,6 +123,14 @@ class QuickstartWorkflow:
         """
         self.props = Properties()
         self.props["pegasus.transfer.threads"] = "16"
+        # With --container, stage the container-compatible worker package
+        # named in the transformation catalog (create_transformation_catalog)
+        # and never download one from inside the job. strict=false covers the
+        # host side, where that package is only used to transfer.
+        if self.worker_package_url:
+            self.props["pegasus.transfer.worker.package"] = "true"
+            self.props["pegasus.transfer.worker.package.strict"] = "false"
+            self.props["pegasus.transfer.worker.package.autodownload"] = "false"
         # Symlink rather than copy when an input already sits on the
         # execution site. A no-op otherwise, so always on.
         self.props["pegasus.transfer.links"] = "true"
@@ -149,6 +179,18 @@ class QuickstartWorkflow:
                 container.add_pegasus_profile(
                     container_arguments=f"--bind {self.wf_dir}")
             self.tc.add_containers(container)
+            if self.worker_package_url:
+                self.tc.add_transformations(
+                    Transformation(
+                        "worker",
+                        namespace="pegasus",
+                        site="local",
+                        pfn=self.worker_package_url,
+                        is_stageable=True,
+                        arch=Arch.X86_64,
+                        os_type=OS.LINUX,
+                    )
+                )
 
         # bin/hello.py and bin/world.py are symlinks to the same script,
         # bin/pegasus-keg.py — the job name and the executable name match, which
@@ -425,6 +467,19 @@ Examples:
             "Input staging: "
             + ("bypassed (shared filesystem)" if bypass else "via staging site")
             + (f"; container binds {workflow.wf_dir}" if bind_wf else ""))
+
+        if args.container:
+            version = planner_version()
+            if version:
+                workflow.worker_package_url = WORKER_PACKAGE_URL.format(v=version)
+                logger.info(
+                    f"Worker package: {WORKER_PACKAGE_PLATFORM} for Pegasus "
+                    f"{version} (staged into the container, no in-job download)")
+            else:
+                logger.warning(
+                    "pegasus-version not found; Pegasus will pick the "
+                    "container's worker package itself (needs curl/wget in "
+                    "the image and internet on the workers)")
 
         workflow.create_pegasus_properties(
             sites_yml=args.sites_yml, bypass_input_staging=bypass)
