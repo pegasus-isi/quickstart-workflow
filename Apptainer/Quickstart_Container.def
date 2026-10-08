@@ -1,5 +1,5 @@
 Bootstrap: docker
-From: python:3.11-slim
+From: python:3.11-slim-trixie
 
 # Container for the Pegasus quickstart (Hello World) workflow.
 #

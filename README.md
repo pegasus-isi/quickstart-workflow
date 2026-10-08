@@ -31,14 +31,18 @@ each job executed.
 The abstract workflow description is portable: it contains no physical file
 locations, executable paths, or cluster endpoints. Those come from the Replica,
 Transformation, and Site catalogs that `workflow_generator.py` writes alongside
-the DAG, which is why the same workflow can run on the submit host and on an
-HTCondor pool without being redefined.
+the DAG, which is why the same workflow can run on the submit host, on an
+HTCondor pool, or on a Slurm cluster without being redefined. Jobs state only
+cores, memory and a wall-clock `runtime`; everything scheduler-specific lives in
+`sites.yml`, managed by `custom_sites.py` (see
+[Choose Where It Runs](#choose-where-it-runs)).
 
 ## Directory Structure
 
 ```
 quickstart-workflow/
 ├── workflow_generator.py           # Pegasus workflow generator
+├── custom_sites.py                 # Writes/merges sites.yml (also standalone)
 ├── bin/
 │   ├── pegasus-keg.py              # The one tool this workflow runs
 │   ├── hello.py -> pegasus-keg.py  # Symlink so the job name matches the executable
@@ -78,6 +82,14 @@ apptainer build Quickstart_Container.sif Apptainer/Quickstart_Container.def
 ./workflow_generator.py --container Quickstart_Container.sif
 ```
 
+The image is Debian 13 (`python:3.11-slim-trixie`) and has no curl/wget, so it
+cannot download a Pegasus worker package for itself. With `--container`, the
+generator asks `pegasus-version` for the planner's version and stages the
+matching `x86_64_deb_13` worker package into each job (`pegasus::worker` in the
+transformation catalog, `pegasus.transfer.worker.package.autodownload = false`).
+If you change the base image, change `WORKER_PACKAGE_PLATFORM` in
+`workflow_generator.py` to match.
+
 ## Usage
 
 ### Test Locally First
@@ -103,8 +115,8 @@ scripts and arguments line up before anything is submitted.
 | `--spin-time` | `3` | Seconds each job spins to simulate work |
 | `--container` | (none) | Run jobs inside this Apptainer `.sif` image |
 | `--submit` | false | Plan and submit the workflow, then wait and print statistics |
-| `-e`, `--execution-site-name` | `local` | Execution site name (`local` = the submit host) |
-| `-s`, `--skip-sites-catalog` | false | Skip site catalog creation |
+| `-e`, `--execution-site` | `compute` with a hosted catalog, else `local` | Site to plan against (`local` = the submit host); alias `--execution-site-name`. See [Choose Where It Runs](#choose-where-it-runs) for the other site options |
+| `-s`, `--skip-sites-catalog` | false | Deprecated: same as `--site-style none` |
 | `-o`, `--output` | `workflow.yml` | Output workflow file |
 
 ### Submit Workflow
@@ -156,6 +168,68 @@ for a different execution environment — no workflow changes are needed:
 On ACCESS Pegasus, `condorpool` jobs land on nodes provisioned from an ACCESS
 resource such as Jetstream. Compare the hostname recorded in `output/f.out`
 between the two runs to see where the jobs executed.
+
+### Choose Where It Runs
+
+The workflow never names a scheduler; `sites.yml` does. On every run
+`workflow_generator.py` calls `custom_sites.ensure_sites_yml()`, which only fills
+gaps, in this order of precedence:
+
+1. **A `sites.yml` entry you provide** (by hand or with `custom_sites.py`) is
+   kept as-is. Other sites in the file are never touched.
+2. **A hosted catalog** named in `~/.pegasusrc`
+   (`pegasus.catalog.site.repo.file`, e.g. on Unity) — Pegasus merges the local
+   `sites.yml` over it. Hosted catalogs define one site, `compute`, which then
+   becomes the default `-e`.
+3. **A default HTCondor site** is added for any other `-e` (e.g. `condorpool`).
+
+A `local` site (`./scratch`, `./output`) is always ensured, since `-o local` and
+`-e local` need it. The generated `pegasus.properties` names `sites.yml`
+explicitly, so `pegasus-plan` finds it from any directory.
+
+```bash
+# Submit host (default without a hosted catalog)
+./workflow_generator.py
+
+# HTCondor pool
+./workflow_generator.py -e condorpool
+
+# Cluster with a hosted catalog: add your account to its "compute" site
+./workflow_generator.py --site-style slurm --project my_lab
+
+# Slurm cluster without a hosted catalog
+./workflow_generator.py -e compute --site-style slurm --queue cpu \
+    --project my_lab --site-scratch /scratch/$USER/quickstart
+```
+
+Against a hosted catalog, `--site-style slurm` writes only your overrides
+(queue, project, profiles) for `compute` as an overlay, not the whole site; a
+style that contradicts the hosted entry is rejected. A site the hosted catalog
+does not define (e.g. `-e condorpool --site-style condor` next to a hosted
+`compute`) gets a complete entry instead; without `--site-style`, the generator
+warns that planning against it will fail.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `-e, --execution-site` | `compute` with a hosted catalog, else `local` | Site to plan against. |
+| `--site-style` | `auto` | `auto`: keep what exists, else add an HTCondor site. `condor`/`slurm`: (re)write this site's entry. `none`: don't touch `sites.yml`. |
+| `--queue`, `--project` | — | Partition and account on a batch site (`pegasus.queue`, `pegasus.project`). `--queue` is required for a Slurm site without a hosted catalog. |
+| `--site-scratch` | `./work` | Slurm: shared scratch visible to the workers and the submit host. |
+| `--site-profile` | — | Extra `NS:KEY=VALUE` profile on the site, e.g. `pegasus:glite.arguments=--constraint=avx512`; repeatable. |
+| `--shared-filesystem` | `auto` | `auto`: jobs read inputs straight from the submit host on Slurm sites (`pegasus.transfer.bypass.input.staging`), never on HTCondor. `yes`/`no` force it. |
+| `--sites-yml` | `sites.yml` | Local site catalog to manage. |
+
+Each job carries a `runtime` of 600 s (`TOOL_CONFIGS`), which batch sites
+require and enforce; condor pools ignore it. With `--container` on a batch site,
+the workflow directory is bound into the container so inputs staged as symlinks
+(`pegasus.transfer.links`) resolve inside it.
+
+`custom_sites.py` also runs standalone, e.g. to prepare `sites.yml` once:
+
+```bash
+./custom_sites.py --style slurm --project my_lab            # overlay on a hosted catalog
+./custom_sites.py --style condor --site condorpool --full   # HTCondor pool
+```
 
 ## Outputs
 

@@ -16,15 +16,30 @@ Usage:
     ./workflow_generator.py
     ./workflow_generator.py -e condorpool -o workflow.yml
     ./workflow_generator.py --submit          # plan, submit, wait, statistics
+
+The site catalog (sites.yml) is managed by custom_sites.py: a sites.yml or
+hosted catalog you provide is kept, and only missing entries are added.
 """
 
 import argparse
 import logging
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 from Pegasus.api import *
+
+# Site-catalog handling shared with the standalone custom_sites.py script.
+sys.path.insert(0, str(Path(__file__).parent.resolve()))
+from custom_sites import (  # noqa: E402
+    HOSTED_SITE, STYLES, ensure_sites_yml, hosted_catalog, parse_profile,
+)
+
+# Execution site when -e is not given: the submit host, unless ~/.pegasusrc
+# names a hosted catalog (pegasushub pegasus-site-catalogs), whose one site is
+# HOSTED_SITE ("compute").
+DEFAULT_SITE = "local"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,44 +49,63 @@ logger = logging.getLogger(__name__)
 
 # Per-tool resource configuration. Both jobs run the same tiny script, so the
 # requirements are identical — kept as a table for consistency with the other
-# workflows in this collection.
+# workflows in this collection. runtime is the wall-clock budget in seconds:
+# batch sites (Slurm through glite) require it and kill a job that exceeds it;
+# condor pools ignore it. Everything else about where a job runs — scheduler,
+# partition, account, scratch — belongs in the site catalog (custom_sites.py).
 TOOL_CONFIGS = {
-    "hello": {"memory": "1 GB", "cores": 1},
-    "world": {"memory": "1 GB", "cores": 1},
+    "hello": {"memory": "1 GB", "cores": 1, "runtime": 600},
+    "world": {"memory": "1 GB", "cores": 1, "runtime": 600},
 }
+
+# Pegasus worker package (kickstart etc.) used *inside* the container, which is
+# Debian 13 (python:3.11-slim-trixie) whatever the submit host runs. Left
+# alone, PegasusLite sees the submit host's package as a mismatch and tries to
+# download a deb_13 one from inside the container, which has no curl/wget
+# (exit code 71). Change this with the container's base image.
+WORKER_PACKAGE_PLATFORM = "x86_64_deb_13"
+WORKER_PACKAGE_URL = ("https://download.pegasus.isi.edu/pegasus/{v}/"
+                      "pegasus-worker-{v}-" + WORKER_PACKAGE_PLATFORM + ".tar.gz")
 
 DEFAULT_INPUT_CONTENTS = (
     "This is the contents of the input file for the hello world workflow!"
 )
 
 
+def planner_version():
+    """Version of the pegasus-plan that will plan this workflow, or None."""
+    try:
+        out = subprocess.run(["pegasus-version"], capture_output=True,
+                             text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    version = out.stdout.strip()
+    return version if out.returncode == 0 and version else None
+
+
 class QuickstartWorkflow:
     """Two-job Hello World workflow: hello -> world."""
 
     wf = None
-    sc = None
     tc = None
     rc = None
     props = None
 
     dagfile = None
     wf_dir = None
-    shared_scratch_dir = None
     local_storage_dir = None
+    worker_package_url = None
     wf_name = "hello-world"
 
     def __init__(self, dagfile="workflow.yml", input_file=None, container_image=None):
         self.dagfile = dagfile
         self.wf_dir = str(Path(__file__).parent.resolve())
-        self.shared_scratch_dir = os.path.join(self.wf_dir, "scratch")
         self.local_storage_dir = os.path.join(self.wf_dir, "output")
         self.input_file = input_file or os.path.join(self.wf_dir, "input", "f.in")
         self.container_image = container_image
 
     def write(self):
-        """Write all catalogs and the workflow to files."""
-        if self.sc is not None:
-            self.sc.write()
+        """Write the catalogs and the workflow (sites.yml: custom_sites.py)."""
         self.props.write()
         self.rc.write()
         self.tc.write()
@@ -80,44 +114,54 @@ class QuickstartWorkflow:
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
-    def create_pegasus_properties(self):
+    def create_pegasus_properties(self, sites_yml="sites.yml",
+                                  bypass_input_staging=False):
+        """Planner properties.
+
+        The site catalog itself is custom_sites.py's business; naming an
+        existing sites.yml here lets pegasus-plan find it from any directory.
+        """
         self.props = Properties()
         self.props["pegasus.transfer.threads"] = "16"
-
-    # ------------------------------------------------------------------
-    # Site Catalog
-    # ------------------------------------------------------------------
-    def create_sites_catalog(self, exec_site_name="local"):
-        self.sc = SiteCatalog()
-
-        local = Site("local").add_directories(
-            Directory(
-                Directory.SHARED_SCRATCH, self.shared_scratch_dir
-            ).add_file_servers(
-                FileServer("file://" + self.shared_scratch_dir, Operation.ALL)
-            ),
-            Directory(
-                Directory.LOCAL_STORAGE, self.local_storage_dir
-            ).add_file_servers(
-                FileServer("file://" + self.local_storage_dir, Operation.ALL)
-            ),
-        )
-        self.sc.add_sites(local)
-
-        # When jobs run on the submit host itself, "local" is the execution
-        # site too and must not be declared twice.
-        if exec_site_name != "local":
-            exec_site = (
-                Site(exec_site_name)
-                .add_condor_profile(universe="vanilla")
-                .add_pegasus_profile(style="condor")
-            )
-            self.sc.add_sites(exec_site)
+        # With --container, stage the container-compatible worker package
+        # named in the transformation catalog (create_transformation_catalog)
+        # and never download one from inside the job. strict=false covers the
+        # host side, where that package is only used to transfer.
+        if self.worker_package_url:
+            self.props["pegasus.transfer.worker.package"] = "true"
+            self.props["pegasus.transfer.worker.package.strict"] = "false"
+            self.props["pegasus.transfer.worker.package.autodownload"] = "false"
+        # Symlink rather than copy when an input already sits on the
+        # execution site. A no-op otherwise, so always on.
+        self.props["pegasus.transfer.links"] = "true"
+        if bypass_input_staging:
+            # Jobs read inputs (scripts, the .sif image) straight from the
+            # submit host's paths instead of through the staging site. Only
+            # valid where workers share a filesystem with the submit host —
+            # a Slurm cluster, typically; not a condor pool staging over
+            # HTCondor file transfer.
+            self.props["pegasus.transfer.bypass.input.staging"] = "true"
+        if os.path.isfile(sites_yml):
+            self.props["pegasus.catalog.site"] = "YAML"
+            self.props["pegasus.catalog.site.file"] = os.path.abspath(sites_yml)
 
     # ------------------------------------------------------------------
     # Transformation Catalog
     # ------------------------------------------------------------------
-    def create_transformation_catalog(self, exec_site_name="local"):
+    def create_transformation_catalog(self, bind_workflow_dir=False):
+        """Containers and transformations; nothing here names a site.
+
+        bind_workflow_dir: on a site that stages through its own filesystem
+        (a Slurm cluster, a hosted catalog) or with bypass staging,
+        pegasus.transfer.links stages inputs as symlinks to absolute paths
+        under the workflow directory. PegasusLite starts the container with
+        --no-home and binds only the job directory, so those links dangle
+        inside it and every job dies with kickstart "Unable to execute the
+        specified binary" (exit 127). Binding the workflow directory at its
+        own path makes them resolve. Never on a condor pool: inputs arrive
+        there as copies and the directory does not exist on the workers, so
+        the bind would fail every job.
+        """
         self.tc = TransformationCatalog()
 
         # The quickstart runs on the bare Python interpreter by default. Pass
@@ -131,20 +175,40 @@ class QuickstartWorkflow:
                 image="file://" + os.path.abspath(self.container_image),
                 image_site="local",
             )
+            if bind_workflow_dir:
+                container.add_pegasus_profile(
+                    container_arguments=f"--bind {self.wf_dir}")
             self.tc.add_containers(container)
+            if self.worker_package_url:
+                self.tc.add_transformations(
+                    Transformation(
+                        "worker",
+                        namespace="pegasus",
+                        site="local",
+                        pfn=self.worker_package_url,
+                        is_stageable=True,
+                        arch=Arch.X86_64,
+                        os_type=OS.LINUX,
+                    )
+                )
 
         # bin/hello.py and bin/world.py are symlinks to the same script,
         # bin/pegasus-keg.py — the job name and the executable name match, which
-        # makes the job easy to spot in the logs.
+        # makes the job easy to spot in the logs. They are registered on
+        # "local", where they live; Pegasus stages them to the execution site.
         transformations = []
         for tool_name, config in TOOL_CONFIGS.items():
             tx = Transformation(
                 tool_name,
-                site=exec_site_name,
+                site="local",
                 pfn=os.path.join(self.wf_dir, f"bin/{tool_name}.py"),
                 is_stageable=True,
                 container=container,
-            ).add_pegasus_profile(memory=config["memory"], cores=config["cores"])
+            ).add_pegasus_profile(
+                memory=config["memory"],
+                cores=config["cores"],
+                runtime=str(config["runtime"]),
+            )
             transformations.append(tx)
 
         self.tc.add_transformations(*transformations)
@@ -189,6 +253,39 @@ class QuickstartWorkflow:
 
 
 # ======================================================================
+# Site catalog
+# ======================================================================
+def setup_site_catalog(args, wf_dir):
+    """Ensure the site catalog can plan args.execution_site; return its style.
+
+    Defaults work untouched (an HTCondor site is added if nothing defines
+    the requested one), a sites.yml or hosted catalog someone provided wins,
+    and --site-style/--queue/--project/... tailor it for a batch cluster.
+    """
+    action, style = ensure_sites_yml(
+        args.sites_yml, args.execution_site, wf_dir,
+        style=args.site_style, queue=args.queue, project=args.project,
+        scratch=args.site_scratch, profiles=args.site_profile)
+    hosted = hosted_catalog()
+    logger.info(f"Site catalog: {args.sites_yml}: {action}"
+                + (f" (merged over hosted {hosted})" if hosted else ""))
+    if style is None and hosted and args.execution_site != "local":
+        logger.info(f"The hosted catalog {hosted} decides how "
+                    f"{args.execution_site!r} submits; hosted catalogs name "
+                    f"their site {HOSTED_SITE!r}.")
+        if args.execution_site != HOSTED_SITE:
+            # Nothing was written for this site, so planning works only if
+            # the hosted catalog happens to define it.
+            logger.warning(
+                f"{args.execution_site!r} is not defined in {args.sites_yml} "
+                f"and hosted catalogs normally define only {HOSTED_SITE!r}: "
+                f"pegasus-plan will fail unless {hosted} has it. Use "
+                f"-e {HOSTED_SITE}, or --site-style condor/slurm to describe "
+                f"{args.execution_site!r}.")
+    return style
+
+
+# ======================================================================
 # main() — CLI argument parsing
 # ======================================================================
 def main():
@@ -199,25 +296,82 @@ def main():
 Examples:
   %(prog)s                                  # generate workflow.yml for site "local"
   %(prog)s -e condorpool                    # run the jobs on an HTCondor pool
+  %(prog)s -e compute --site-style slurm --project my_lab   # hosted catalog
   %(prog)s --submit                         # generate, plan, submit, and wait
   %(prog)s --container Quickstart_Container.sif
 """,
     )
 
-    # --- Standard Pegasus arguments ---
+    # --- Execution site. The workflow states only cores/memory/runtime;
+    # these options shape the site catalog (custom_sites.py).
+    parser.add_argument(
+        "-e",
+        "--execution-site",
+        "--execution-site-name",
+        dest="execution_site",
+        metavar="STR",
+        type=str,
+        default=None,
+        help=f"Site to plan against (default: {HOSTED_SITE!r} when "
+             "~/.pegasusrc names a hosted catalog, which call their site "
+             f"that; otherwise {DEFAULT_SITE!r}, i.e. the submit host)",
+    )
+    parser.add_argument(
+        "--site-style",
+        choices=("auto",) + STYLES + ("none",),
+        default="auto",
+        help="How the execution site is described in sites.yml. auto (default): "
+             "keep a sites.yml entry or hosted catalog if one exists, else add "
+             "an HTCondor site. condor/slurm: (re)write that site's entry. "
+             "none: leave sites.yml alone.",
+    )
+    parser.add_argument(
+        "--queue",
+        metavar="PARTITION",
+        help="Batch partition/queue jobs submit to (required for "
+             "--site-style slurm without a hosted catalog)",
+    )
+    parser.add_argument(
+        "--project",
+        metavar="ACCOUNT",
+        help="Allocation/account charged on a batch site",
+    )
+    parser.add_argument(
+        "--site-scratch",
+        metavar="DIR",
+        help="Slurm only: shared scratch visible to workers and the submit "
+             "host (default: ./work)",
+    )
+    parser.add_argument(
+        "--site-profile",
+        action="append",
+        default=[],
+        type=parse_profile,
+        metavar="NS:KEY=VALUE",
+        help="Extra profile on the execution site, e.g. "
+             "pegasus:glite.arguments=--constraint=avx512; repeatable",
+    )
+    parser.add_argument(
+        "--shared-filesystem",
+        choices=("auto", "yes", "no"),
+        default="auto",
+        help="Let jobs read inputs (incl. a container image) directly from "
+             "the submit host instead of via staging. auto (default): on for a "
+             "Slurm site, off for HTCondor, which stages over file transfer.",
+    )
+    parser.add_argument(
+        "--sites-yml",
+        metavar="FILE",
+        type=str,
+        default="sites.yml",
+        help="Local site catalog (default: sites.yml). Named in the generated "
+             "properties, so pegasus-plan finds it from any directory.",
+    )
     parser.add_argument(
         "-s",
         "--skip-sites-catalog",
         action="store_true",
-        help="Skip site catalog creation",
-    )
-    parser.add_argument(
-        "-e",
-        "--execution-site-name",
-        metavar="STR",
-        type=str,
-        default="local",
-        help="Execution site name (default: local, i.e. the submit host)",
+        help="Deprecated: same as --site-style none",
     )
     parser.add_argument(
         "-o",
@@ -257,6 +411,10 @@ Examples:
     )
 
     args = parser.parse_args()
+    if args.execution_site is None:
+        args.execution_site = HOSTED_SITE if hosted_catalog() else DEFAULT_SITE
+    if args.skip_sites_catalog:
+        args.site_style = "none"
 
     wf_dir = str(Path(__file__).parent.resolve())
     input_file = args.input_file or os.path.join(wf_dir, "input", "f.in")
@@ -281,7 +439,7 @@ Examples:
     logger.info("QUICKSTART (HELLO WORLD) WORKFLOW GENERATOR")
     logger.info("=" * 70)
     logger.info(f"Input file: {input_file}")
-    logger.info(f"Execution site: {args.execution_site_name}")
+    logger.info(f"Execution site: {args.execution_site}")
     logger.info(f"Container: {args.container or 'none'}")
     logger.info(f"Output file: {args.output}")
     logger.info("=" * 70)
@@ -293,14 +451,39 @@ Examples:
             container_image=args.container,
         )
 
-        workflow.create_pegasus_properties()
+        style = setup_site_catalog(args, workflow.wf_dir)
+        if args.shared_filesystem == "auto":
+            bypass = style is not None and style != "condor"
+        else:
+            bypass = args.shared_filesystem == "yes"
+        # A site that is not a condor pool stages through its own filesystem
+        # (an unknown style over a hosted catalog counts: hosted catalogs are
+        # batch sites), and then staged inputs are symlinks into wf_dir.
+        batch_site = args.execution_site != "local" and (
+            style not in (None, "condor")
+            or (style is None and hosted_catalog() is not None))
+        bind_wf = bool(args.container) and (batch_site or bypass)
+        logger.info(
+            "Input staging: "
+            + ("bypassed (shared filesystem)" if bypass else "via staging site")
+            + (f"; container binds {workflow.wf_dir}" if bind_wf else ""))
 
-        if not args.skip_sites_catalog:
-            workflow.create_sites_catalog(exec_site_name=args.execution_site_name)
+        if args.container:
+            version = planner_version()
+            if version:
+                workflow.worker_package_url = WORKER_PACKAGE_URL.format(v=version)
+                logger.info(
+                    f"Worker package: {WORKER_PACKAGE_PLATFORM} for Pegasus "
+                    f"{version} (staged into the container, no in-job download)")
+            else:
+                logger.warning(
+                    "pegasus-version not found; Pegasus will pick the "
+                    "container's worker package itself (needs curl/wget in "
+                    "the image and internet on the workers)")
 
-        workflow.create_transformation_catalog(
-            exec_site_name=args.execution_site_name
-        )
+        workflow.create_pegasus_properties(
+            sites_yml=args.sites_yml, bypass_input_staging=bypass)
+        workflow.create_transformation_catalog(bind_workflow_dir=bind_wf)
         workflow.create_replica_catalog()
         workflow.create_workflow(args)
         workflow.write()
@@ -308,7 +491,7 @@ Examples:
         logger.info(f"\nWorkflow written to {args.output}")
         logger.info(
             f"Submit: pegasus-plan --submit "
-            f"-s {args.execution_site_name} -o local {args.output}"
+            f"-s {args.execution_site} -o local {args.output}"
         )
 
     except Exception as e:
@@ -326,7 +509,7 @@ Examples:
     # may be passed to them.
     try:
         workflow.wf.plan(
-            sites=[args.execution_site_name],
+            sites=[args.execution_site],
             output_sites=["local"],
             output_dir=workflow.local_storage_dir,
             submit=True,
