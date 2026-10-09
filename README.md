@@ -124,7 +124,7 @@ The generator writes `workflow.yml` and its catalogs, then prints the
 ### Plan and Submit
 
 ```bash
-pegasus-plan --dir submit -s compute -o local --submit workflow.yml
+pegasus-plan --dir submit -s compute -o local --output-dir "$PWD/output" --submit workflow.yml
 ```
 
 Use the `-e` value you generated with as `-s` here. Note the line in the output
@@ -168,11 +168,11 @@ Pegasus version.
 
 # A plain HTCondor pool with no site catalog: Pegasus provides "condorpool"
 ./workflow_generator.py -e condorpool
-pegasus-plan --dir submit -s condorpool -o local --submit workflow.yml
+pegasus-plan --dir submit -s condorpool -o local --output-dir "$PWD/output" --submit workflow.yml
 
 # The submit host
 ./workflow_generator.py -e local
-pegasus-plan --dir submit -s local -o local --submit workflow.yml
+pegasus-plan --dir submit -s local -o local --output-dir "$PWD/output" --submit workflow.yml
 ```
 
 Pegasus has no built-in `compute` site: with no hosted catalog configured,
@@ -189,15 +189,15 @@ see where the jobs executed.
 |--------|-------------|
 | `f.out` | Final output: execution hostnames plus the accumulated input contents |
 
-Where it lands depends on the `local` site in use. The CLI writes no site
-catalog, so Pegasus uses its default local storage, `./wf-output/`; the
-notebook's `create_sites_catalog()` sets it to `./output/`.
+It lands in `./output/` either way: the notebook's `create_sites_catalog()`
+puts the `local` site's storage there, and the printed plan command passes
+`--output-dir "$PWD/output"` (without it, Pegasus's built-in `local` site
+would use `./wf-output/`).
 
 `f.inter` is an intermediate file (`stage_out=False`), so it stays in scratch.
 
 ```bash
-cat wf-output/f.out     # CLI run
-cat output/f.out        # notebook run
+cat output/f.out
 ```
 
 ## Resource Requirements
