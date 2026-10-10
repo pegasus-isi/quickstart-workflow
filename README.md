@@ -33,16 +33,15 @@ locations, executable paths, or cluster endpoints. Those come from the Replica,
 Transformation, and Site catalogs that `workflow_generator.py` writes alongside
 the DAG, which is why the same workflow can run on the submit host, on an
 HTCondor pool, or on a Slurm cluster without being redefined. Jobs state only
-cores, memory and a wall-clock `runtime`; everything scheduler-specific lives in
-`sites.yml`, managed by `custom_sites.py` (see
-[Choose Where It Runs](#choose-where-it-runs)).
+cores and memory; where they run comes from a site catalog you choose, never
+from the generator (see [Choose Where It Runs](#choose-where-it-runs)).
 
 ## Directory Structure
 
 ```
 quickstart-workflow/
-├── workflow_generator.py           # Pegasus workflow generator
-├── custom_sites.py                 # Writes/merges sites.yml (also standalone)
+├── workflow_generator.py           # Pegasus workflow generator (writes catalogs, never submits)
+├── Quickstart-Workflow.ipynb       # Notebook driving the same generator class
 ├── bin/
 │   ├── pegasus-keg.py              # The one tool this workflow runs
 │   ├── hello.py -> pegasus-keg.py  # Symlink so the job name matches the executable
@@ -79,13 +78,14 @@ inside a container instead:
 
 ```bash
 apptainer build Quickstart_Container.sif Apptainer/Quickstart_Container.def
-./workflow_generator.py --container Quickstart_Container.sif
+./workflow_generator.py --container Quickstart_Container.sif -e condorpool
 ```
 
 The image is Debian 13 (`python:3.11-slim-trixie`) and has no curl/wget, so it
-cannot download a Pegasus worker package for itself. With `--container`, the
-generator asks `pegasus-version` for the planner's version and stages the
-matching `x86_64_deb_13` worker package into each job (`pegasus::worker` in the
+cannot download a Pegasus worker package for itself (the job dies with exit 71,
+*Unable to find curl/wget*). With `--container`, the generator asks
+`pegasus-version` for the planner's version and stages the matching
+`x86_64_deb_13` worker package into each job (`pegasus::worker` in the
 transformation catalog, `pegasus.transfer.worker.package.autodownload = false`).
 If you change the base image, change `WORKER_PACKAGE_PLATFORM` in
 `workflow_generator.py` to match.
@@ -107,6 +107,9 @@ scripts and arguments line up before anything is submitted.
 ./workflow_generator.py --output workflow.yml
 ```
 
+The generator writes `workflow.yml` and its catalogs, then prints the
+`pegasus-plan` command. It never plans or submits by itself.
+
 ### CLI Options
 
 | Option | Default | Description |
@@ -114,20 +117,20 @@ scripts and arguments line up before anything is submitted.
 | `--input-file` | `input/f.in` | Input file for the `hello` job (created if missing) |
 | `--spin-time` | `3` | Seconds each job spins to simulate work |
 | `--container` | (none) | Run jobs inside this Apptainer `.sif` image |
-| `--submit` | false | Plan and submit the workflow, then wait and print statistics |
-| `-e`, `--execution-site` | `compute` with a hosted catalog, else `local` | Site to plan against (`local` = the submit host); alias `--execution-site-name`. See [Choose Where It Runs](#choose-where-it-runs) for the other site options |
-| `-s`, `--skip-sites-catalog` | false | Deprecated: same as `--site-style none` |
+| `-s`, `--hosted-site-catalog` | (none; `~/.pegasusrc` if set) | [Hosted site catalog](https://github.com/pegasushub/pegasus-site-catalogs/tree/main/conf) to plan against, e.g. `access-pegasus.yml`, `unity.yml`; written to `pegasus.properties` |
+| `-e`, `--execution-site-name` | `compute` | Execution site name; `condorpool` on a plain HTCondor pool with no site catalog, `local` for the submit host |
 | `-o`, `--output` | `workflow.yml` | Output workflow file |
 
-### Submit Workflow
+### Plan and Submit
 
 ```bash
-pegasus-plan --submit -s local -o local workflow.yml
+pegasus-plan --dir submit -s compute -o local --output-dir "$PWD/output" --submit workflow.yml
 ```
 
-Note the line in the output starting with `pegasus-status` — it contains the
-command to monitor the run, and the path to the submit directory holding all the
-files needed to submit and monitor the workflow.
+Use the `-e` value you generated with as `-s` here. Note the line in the output
+starting with `pegasus-status` — it contains the command to monitor the run, and
+the path to the submit directory holding all the files needed to submit and
+monitor the workflow.
 
 ### Monitor Workflow
 
@@ -136,109 +139,62 @@ pegasus-status <run-directory>
 pegasus-statistics <run-directory>
 ```
 
-### Plan and Submit from Python
+### The Notebook
 
-Because `workflow_generator.py` keeps a reference to the `Workflow` object, it
-can plan, run, and monitor the workflow directly — these are wrappers around the
-Pegasus CLI tools and accept the same arguments:
-
-```bash
-./workflow_generator.py --submit
-```
-
-which is equivalent to:
-
-```python
-workflow.wf.plan(sites=["local"], output_sites=["local"],
-                 output_dir=workflow.local_storage_dir, submit=True)
-workflow.wf.wait()          # block until the workflow finishes
-workflow.wf.statistics()    # or workflow.wf.analyze() if it failed
-```
-
-### Run on an HTCondor Pool
-
-The workflow above ran on the submit host because it was planned for the site
-named `local`. To run the same abstract workflow on an HTCondor pool, replan it
-for a different execution environment — no workflow changes are needed:
-
-```bash
-./workflow_generator.py -e condorpool --submit
-```
-
-On ACCESS Pegasus, `condorpool` jobs land on nodes provisioned from an ACCESS
-resource such as Jetstream. Compare the hostname recorded in `output/f.out`
-between the two runs to see where the jobs executed.
+`Quickstart-Workflow.ipynb` runs the same steps interactively. It imports
+`QuickstartWorkflow` from `workflow_generator.py` and calls its methods, so the
+pipeline is defined in one place only, then plans and submits from an explicit
+cell (`workflow.plan_submit()`), monitors with `status()`/`wait()` and reports
+with `statistics()`.
 
 ### Choose Where It Runs
 
-The workflow never names a scheduler; `sites.yml` does. On every run
-`workflow_generator.py` calls `custom_sites.ensure_sites_yml()`, which only fills
-gaps, in this order of precedence:
-
-1. **A `sites.yml` entry you provide** (by hand or with `custom_sites.py`) is
-   kept as-is. Other sites in the file are never touched.
-2. **A hosted catalog** named in `~/.pegasusrc`
-   (`pegasus.catalog.site.repo.file`, e.g. on Unity) — Pegasus merges the local
-   `sites.yml` over it. Hosted catalogs define one site, `compute`, which then
-   becomes the default `-e`.
-3. **A default HTCondor site** is added for any other `-e` (e.g. `condorpool`).
-
-A `local` site (`./scratch`, `./output`) is always ensured, since `-o local` and
-`-e local` need it. The generated `pegasus.properties` names `sites.yml`
-explicitly, so `pegasus-plan` finds it from any directory.
+Where jobs run depends on your resource provider and allocation, so it lives in
+a site catalog you choose, not in the workflow. Jobs run on a site named
+`compute`, the one site every centrally hosted catalog
+([pegasus-site-catalogs](https://github.com/pegasushub/pegasus-site-catalogs/tree/main/conf))
+defines; `pegasus-plan` downloads the catalog from the branch matching its
+Pegasus version.
 
 ```bash
-# Submit host (default without a hosted catalog)
+# A hosted catalog, named per workflow
+./workflow_generator.py -s access-pegasus.yml
+
+# ...or once per user, in ~/.pegasusrc (as the ACCESS training setup does):
+#   pegasus.catalog.site.repo.file = unity.yml
+#   env.RESOURCE_USERNAME = jdoe
+#   env.RESOURCE_PROJECT = my_lab
 ./workflow_generator.py
 
-# HTCondor pool
+# A plain HTCondor pool with no site catalog: Pegasus provides "condorpool"
 ./workflow_generator.py -e condorpool
+pegasus-plan --dir submit -s condorpool -o local --output-dir "$PWD/output" --submit workflow.yml
 
-# Cluster with a hosted catalog: add your account to its "compute" site
-./workflow_generator.py --site-style slurm --project my_lab
-
-# Slurm cluster without a hosted catalog
-./workflow_generator.py -e compute --site-style slurm --queue cpu \
-    --project my_lab --site-scratch /scratch/$USER/quickstart
+# The submit host
+./workflow_generator.py -e local
+pegasus-plan --dir submit -s local -o local --output-dir "$PWD/output" --submit workflow.yml
 ```
 
-Against a hosted catalog, `--site-style slurm` writes only your overrides
-(queue, project, profiles) for `compute` as an overlay, not the whole site; a
-style that contradicts the hosted entry is rejected. A site the hosted catalog
-does not define (e.g. `-e condorpool --site-style condor` next to a hosted
-`compute`) gets a complete entry instead; without `--site-style`, the generator
-warns that planning against it will fail.
+Pegasus has no built-in `compute` site: with no hosted catalog configured,
+`-e compute` fails to plan with *"Execution site compute not loaded into site
+store"*. Use `-e condorpool` there, or the notebook, which writes a local
+HTCondor `compute` site with `create_sites_catalog()`.
 
-| Option | Default | Meaning |
-|---|---|---|
-| `-e, --execution-site` | `compute` with a hosted catalog, else `local` | Site to plan against. |
-| `--site-style` | `auto` | `auto`: keep what exists, else add an HTCondor site. `condor`/`slurm`: (re)write this site's entry. `none`: don't touch `sites.yml`. |
-| `--queue`, `--project` | — | Partition and account on a batch site (`pegasus.queue`, `pegasus.project`). `--queue` is required for a Slurm site without a hosted catalog. |
-| `--site-scratch` | `./work` | Slurm: shared scratch visible to the workers and the submit host. |
-| `--site-profile` | — | Extra `NS:KEY=VALUE` profile on the site, e.g. `pegasus:glite.arguments=--constraint=avx512`; repeatable. |
-| `--shared-filesystem` | `auto` | `auto`: jobs read inputs straight from the submit host on Slurm sites (`pegasus.transfer.bypass.input.staging`), never on HTCondor. `yes`/`no` force it. |
-| `--sites-yml` | `sites.yml` | Local site catalog to manage. |
-
-Each job carries a `runtime` of 600 s (`TOOL_CONFIGS`), which batch sites
-require and enforce; condor pools ignore it. With `--container` on a batch site,
-the workflow directory is bound into the container so inputs staged as symlinks
-(`pegasus.transfer.links`) resolve inside it.
-
-`custom_sites.py` also runs standalone, e.g. to prepare `sites.yml` once:
-
-```bash
-./custom_sites.py --style slurm --project my_lab            # overlay on a hosted catalog
-./custom_sites.py --style condor --site condorpool --full   # HTCondor pool
-```
+Compare the hostname recorded in `f.out` between runs on different sites to
+see where the jobs executed.
 
 ## Outputs
 
 | Output | Description |
 |--------|-------------|
-| `output/f.out` | Final output: execution hostnames plus the accumulated input contents |
+| `f.out` | Final output: execution hostnames plus the accumulated input contents |
 
-`f.inter` is an intermediate file (`stage_out=False`), so it stays in scratch and
-is not copied to `output/`.
+It lands in `./output/` either way: the notebook's `create_sites_catalog()`
+puts the `local` site's storage there, and the printed plan command passes
+`--output-dir "$PWD/output"` (without it, Pegasus's built-in `local` site
+would use `./wf-output/`).
+
+`f.inter` is an intermediate file (`stage_out=False`), so it stays in scratch.
 
 ```bash
 cat output/f.out
